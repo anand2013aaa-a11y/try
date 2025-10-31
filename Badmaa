@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="mn">
+<head>
+<meta charset="utf-8">
+<title>Katana Arena Online v4</title>
+<style>
+body {
+  margin: 0;
+  background: #111;
+  color: white;
+  font-family: sans-serif;
+  overflow: hidden;
+}
+canvas {
+  background: #222;
+  display: block;
+  margin: 0 auto;
+}
+#ui, #leaderboard, #chat {
+  position: fixed;
+  padding: 5px;
+  border-radius: 8px;
+  background: rgba(0,0,0,0.5);
+}
+#ui { left: 10px; top: 10px; }
+#leaderboard { right: 10px; top: 10px; }
+#chat { left: 10px; bottom: 10px; width: 250px; }
+#chat-log { height: 100px; overflow-y: auto; font-size: 12px; }
+input, button {
+  border: none;
+  border-radius: 4px;
+  padding: 4px 6px;
+  margin: 2px;
+}
+button {
+  cursor: pointer;
+  background: #444;
+  color: white;
+}
+button:hover { background: #666; }
+</style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+
+<div id="ui">
+  <div><b>Inventory</b></div>
+  <button onclick="equip('Katana','Cloth')">Katana</button>
+  <button onclick="equip('Longsword','Steel')">Longsword</button>
+  <input id="renameInput" placeholder="New name..." maxlength="20">
+  <button onclick="renamePlayer()">Change</button>
+</div>
+
+<div id="leaderboard">🏆 Leaderboard</div>
+
+<div id="chat">
+  <div id="chat-log"></div>
+  <input id="chat-input" placeholder="Type..." style="width:80%">
+  <button onclick="sendChat()">💬</button>
+</div>
+
+<script>
+const canvas = document.getElementById("game"), ctx = canvas.getContext("2d");
+const lb = document.getElementById("leaderboard"), chatLog = document.getElementById("chat-log");
+
+// WebSocket (may fail if host doesn't accept ws; that's fine — code protects send)
+const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+let ws;
+try {
+  ws = new WebSocket(wsUrl);
+} catch (e) {
+  console.warn("WebSocket init failed:", e);
+  ws = null;
+}
+
+function safeSend(obj){
+  if(!ws) return;
+  try{
+    if(ws.readyState === WebSocket.OPEN){
+      ws.send(JSON.stringify(obj));
+    }
+  }catch(e){
+    console.warn("ws send failed:", e);
+  }
+}
+
+let you = null;
+let others = new Map();
+let swings = new Map();
+let keys = {};
+let mouse = {x: canvas.width/2, y: canvas.height/2};
+let boss = null;
+let SPEED = 200;
+
+// Keyboard + mouse
+document.addEventListener("keydown", e => {
+    keys[e.key.toLowerCase()] = true;
+    if(!you) return;
+    switch(e.key){
+        case "1": safeSend({type:"shopBuy", item:"Katana"}); break;
+        case "2": safeSend({type:"shopBuy", item:"Longsword"}); break;
+        case "3": safeSend({type:"shopBuy", item:"Steel Armor"}); break;
+        case "4": safeSend({type:"shopBuy", item:"Dragon Armor"}); break;
+    }
+});
+document.addEventListener("keyup", e => keys[e.key.toLowerCase()] = false);
+
+canvas.addEventListener("mousemove", e => {
+    const r = canvas.getBoundingClientRect();
+    mouse.x = e.clientX - r.left;
+    mouse.y = e.clientY - r.top;
+});
+canvas.addEventListener("mousedown", () => { 
+    if(you && you.alive) safeSend({type:"swing"}); 
+});
+
+// WebSocket messages (with defensive guards)
+if(ws){
+  ws.onmessage = ev => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch(e){ console.warn("invalid ws msg", e); return; }
+      switch(msg.type){
+          case 'init':
+              you = msg.you || { id: null, x: canvas.width/2, y: canvas.height/2, r:0, hp:100, inventory:[], gold:0, alive:true, name:"You" };
+              boss = msg.boss || null;
+              you.inventory = you.inventory || [];
+              you.gold = you.gold || 0;
+              you.hp = you.hp || 100;
+              if(Array.isArray(msg.players)){
+                msg.players.forEach(p => { 
+                    if(!p.hp) p.hp = 100;
+                    if(p.id !== you.id) others.set(p.id,p);
+                });
+              }
+              break;
+          case 'join': 
+              if(msg.player){
+                if(!msg.player.hp) msg.player.hp = 100;
+                if(msg.player.id !== (you && you.id)) others.set(msg.player.id, msg.player);
+              }
+              break;
+          case 'leave': 
+              if(msg.id) others.delete(msg.id); 
+              break;
+          case 'update': 
+              if(msg.player && you && msg.player.id !== you.id) others.set(msg.player.id,msg.player); 
+              break;
+          case 'hit': 
+              if(msg.to && you && msg.to === you.id && typeof msg.hp === "number") you.hp = msg.hp; 
+              break;
+          case 'death': 
+              if(msg.id && you && msg.id === you.id) you.alive = false; 
+              else if(msg.id) {
+                const p = others.get(msg.id);
+                if(p) p.alive = false;
+              }
+              break;
+          case 'respawn': 
+              if(msg.player){
+                if(msg.player.id === (you && you.id)) you = msg.player;
+                else others.set(msg.player.id,msg.player);
+              }
+              break;
+          case 'swing': 
+              if(msg.id) swings.set(msg.id, performance.now()); 
+              break;
+          case 'leaderboard': 
+              if(Array.isArray(msg.top)){
+                lb.innerHTML = "🏆 <b>Leaderboard</b><br>" + 
+                    msg.top.map((p,i)=>`${i+1}. ${p.name} (${p.kills})`).join("<br>");
+              }
+              break;
+          case 'chat': 
+              if(msg.from && typeof msg.text === "string"){
+                chatLog.innerHTML += `<div><b>${escapeHtml(msg.from)}:</b> ${escapeHtml(msg.text)}</div>`; 
+                chatLog.scrollTop = chatLog.scrollHeight; 
+              }
+              break;
+          case 'rename': 
+              if(msg.id && msg.name){
+                if(you && msg.id === you.id) you.name = msg.name; 
+                else if(others.has(msg.id)) others.get(msg.id).name = msg.name; 
+              }
+              break;
+          case 'equip': 
+              // server may send id or target you; handle both
+              if(msg.id){
+                if(you && msg.id === you.id){
+                  you.weapon = msg.weapon; you.armor = msg.armor;
+                } else if(others.has(msg.id)){
+                  const p = others.get(msg.id);
+                  p.weapon = msg.weapon; p.armor = msg.armor;
+                }
+              } else {
+                // fallback: apply to you if no id (older server behaviour)
+                if(you){
+                  you.weapon = msg.weapon; you.armor = msg.armor;
+                }
+              }
+              break;
+          case 'bossUpdate': if(msg.boss) boss = msg.boss; break;
+          case 'bossDeath': if(boss) boss.alive = false; break;
+          case 'bossRespawn': if(msg.boss) boss = msg.boss; break;
+          case 'shopUpdate': 
+              if(you){
+                you.gold = msg.gold || 0; 
+                you.inventory = msg.inventory || you.inventory || []; 
+              }
+              break;
+      }
+  };
+
+  ws.onopen = () => console.log("WebSocket opened");
+  ws.onclose = () => console.log("WebSocket closed");
+  ws.onerror = (e) => console.warn("WebSocket error", e);
+}
+
+// Chat / rename / equip
+function sendChat(){
+    const input = document.getElementById("chat-input");
+    const text = input.value.trim(); 
+    if(!text) return; 
+    safeSend({type:"chat", text});
+    input.value="";
+}
+function renamePlayer(){
+    const val = document.getElementById("renameInput").value.trim();
+    if(!val) return; 
+    safeSend({type:"rename", name:val});
+}
+function equip(w,a){ 
+    safeSend({type:"equip", weapon:w, armor:a}); 
+}
+
+// Utility: escape HTML for chat/names to avoid injection
+function escapeHtml(str){
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Main loop
+let last = performance.now();
+function loop(now){
+    const dt = (now - last) / 1000; 
+    last = now;
+    if(you && you.alive){
+        let dx=0, dy=0;
+        if(keys['w']) dy -= 1; 
+        if(keys['s']) dy += 1; 
+        if(keys['a']) dx -= 1; 
+        if(keys['d']) dx += 1;
+        const len = Math.hypot(dx,dy) || 1;
+        you.x = (typeof you.x === "number" ? you.x : canvas.width/2) + dx/len * SPEED * dt; 
+        you.y = (typeof you.y === "number" ? you.y : canvas.height/2) + dy/len * SPEED * dt;
+        you.r = Math.atan2(mouse.y - you.y, mouse.x - you.x);
+        safeSend({type:"move", x:you.x, y:you.y, r:you.r});
+    }
+    draw(now);
+    drawUI();
+    requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// Draw functions
+function draw(now){
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if(you) drawPlayer(you, true, now);
+    for(const p of others.values()) drawPlayer(p, false, now);
+    if(boss) drawBoss(boss);
+}
+
+function drawPlayer(p, isYou, now){
+    // Defensive defaults
+    const px = (typeof p.x === "number") ? p.x : canvas.width/2;
+    const py = (typeof p.y === "number") ? p.y : canvas.height/2;
+    const pr = (typeof p.r === "number") ? p.r : 0;
+    const alive = (typeof p.alive === "boolean") ? p.alive : true;
+    const hp = (typeof p.hp === "number") ? p.hp : 100;
+    const name = p.name || "Player";
+    const level = p.level || 1;
+
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(pr);
+    ctx.fillStyle = !alive ? "#555" : (isYou ? "#4caf50" : "#f44336");
+    ctx.beginPath(); 
+    ctx.arc(0, 0, 15, 0, Math.PI*2); 
+    ctx.fill();
+
+    const swingT = swings.get(p.id) || 0;
+    if(now - swingT < 200){
+        ctx.save();
+        ctx.rotate(((now - swingT) / 200) * Math.PI / 3);
+        ctx.strokeStyle = "yellow"; 
+        ctx.lineWidth = 3;
+        ctx.beginPath(); 
+        ctx.moveTo(0,0); 
+        ctx.lineTo(40,0); 
+        ctx.stroke();
+        ctx.restore();
+    } else {
+        ctx.strokeStyle = "white"; 
+        ctx.beginPath(); 
+        ctx.moveTo(0,0); 
+        ctx.lineTo(30,0); 
+        ctx.stroke();
+    }
+    ctx.restore();
+
+    // HP + name
+    ctx.fillStyle = "red"; 
+    ctx.fillRect(px-20, py-25, 40, 5);
+    ctx.fillStyle = "lime"; 
+    ctx.fillRect(px-20, py-25, Math.max(0, Math.min(1, hp/100))*40, 5);
+    ctx.fillStyle = "white"; 
+    ctx.font = "12px sans-serif";
+    ctx.fillText(`${name} Lv${level}`, px-25, py-35);
+}
+
+function drawBoss(b){
+    if(!b) return;
+    const bx = (typeof b.x === "number") ? b.x : canvas.width/2;
+    const by = (typeof b.y === "number") ? b.y : canvas.height/2;
+    const balive = (typeof b.alive === "boolean") ? b.alive : true;
+    const bhp = (typeof b.hp === "number") ? b.hp : 500;
+
+    ctx.save();
+    ctx.translate(bx, by);
+    ctx.fillStyle = balive ? "purple" : "#555";
+    ctx.beginPath(); 
+    ctx.arc(0, 0, 30, 0, Math.PI*2); 
+    ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = "red"; 
+    ctx.fillRect(bx-30, by-40, 60, 5);
+    ctx.fillStyle = "lime"; 
+    ctx.fillRect(bx-30, by-40, Math.max(0, Math.min(1, bhp/500))*60, 5);
+    ctx.fillStyle = "white"; 
+    ctx.font = "12px sans-serif";
+    ctx.fillText(`Boss`, bx-20, by-50);
+}
+
+// UI overlay
+function drawUI(){
+    if(!you) return;
+    ctx.save();
+
+    // Gold
+    ctx.fillStyle = "gold";
+    ctx.font = "16px sans-serif";
+    ctx.fillText(`💰 ${you.gold || 0}`, 10, canvas.height - 10);
+
+    // Inventory box
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(canvas.width - 160, canvas.height - 60, 150, 50);
+    ctx.fillStyle = "white";
+    ctx.font = "12px sans-serif";
+    ctx.fillText("Inventory:", canvas.width - 150, canvas.height - 45);
+    (you.inventory || []).forEach((item, i) => {
+        ctx.fillText(`• ${item}`, canvas.width - 150, canvas.height - 30 + i*12);
+    });
+
+    // Shop box
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(canvas.width - 160, 10, 150, 90);
+    ctx.fillStyle = "white";
+    ctx.fillText("Shop:", canvas.width - 150, 25);
+    const shopItems = ["Katana", "Longsword", "Steel Armor", "Dragon Armor"];
+    shopItems.forEach((item, i) => {
+        ctx.fillText(`${i+1}. ${item} - 50G`, canvas.width - 150, 40 + i*15);
+    });
+
+    ctx.restore();
+}
+</script>
+</body>
+</html>
